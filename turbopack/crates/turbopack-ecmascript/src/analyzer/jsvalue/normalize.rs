@@ -3,14 +3,14 @@ use std::{hash::BuildHasherDefault, mem::take};
 use rustc_hash::FxHasher;
 use turbo_tasks::FxIndexSet;
 
-use crate::analyzer::{JsValue, jsvalue::similar::SimilarJsValue};
+use crate::analyzer::{JsValue, arena::Arena, jsvalue::similar::SimilarJsValue};
 
 // Alternatives management
-impl JsValue {
+impl<'a> JsValue<'a> {
     /// Add an alternative to the current value. Might be a no-op if the value
     /// already contains this alternative. Potentially expensive operation
     /// as it has to compare the value with all existing alternatives.
-    pub(crate) fn add_alt(&mut self, v: Self) {
+    pub(crate) fn add_alt(&mut self, arena: &'a Arena, v: Self) {
         if self == &v {
             return;
         }
@@ -29,7 +29,7 @@ impl JsValue {
             let l = take(self);
             *self = JsValue::Alternatives {
                 total_nodes: 1 + l.total_nodes() + v.total_nodes(),
-                values: vec![l, v],
+                values: arena.vec_from_iter([l, v]),
                 logical_property: None,
             };
         }
@@ -37,10 +37,10 @@ impl JsValue {
 }
 
 // Normalization
-impl JsValue {
+impl<'a> JsValue<'a> {
     /// Normalizes only the current node. Nested alternatives, concatenations,
     /// or operations are collapsed.
-    pub fn normalize_shallow(&mut self) {
+    pub fn normalize_shallow(&mut self, arena: &'a Arena) {
         match self {
             JsValue::Alternatives {
                 total_nodes: _,
@@ -54,7 +54,10 @@ impl JsValue {
                         values.len(),
                         BuildHasherDefault::<FxHasher>::default(),
                     );
-                    for v in take(values) {
+                    // Detach the children into an owned buffer so we can rebuild `values` in
+                    // place (the arena-backed `BumpVec` has no `Default`, so it can't be `take`n).
+                    let taken: Vec<JsValue> = values.drain(..).collect();
+                    for v in taken {
                         match v {
                             JsValue::Alternatives {
                                 total_nodes: _,
@@ -73,7 +76,7 @@ impl JsValue {
                     if set.len() == 1 {
                         *self = set.into_iter().next().unwrap().0;
                     } else {
-                        *values = set.into_iter().map(|v| v.0).collect();
+                        values.extend(set.into_iter().map(|v| v.0));
                         self.update_total_nodes();
                     }
                 }
@@ -84,7 +87,8 @@ impl JsValue {
 
                 // TODO(kdy1): Remove duplicate
                 let mut new: Vec<JsValue> = vec![];
-                for v in take(v) {
+                let taken: Vec<JsValue> = v.drain(..).collect();
+                for v in taken {
                     if let Some(str) = v.as_str() {
                         if let Some(last) = new.last_mut() {
                             if let Some(last_str) = last.as_str() {
@@ -104,21 +108,22 @@ impl JsValue {
                 if new.len() == 1 {
                     *self = new.into_iter().next().unwrap();
                 } else {
-                    *v = new;
+                    v.extend(new);
                     self.update_total_nodes();
                 }
             }
             JsValue::Add(_, v) => {
                 let mut added: Vec<JsValue> = Vec::new();
-                let mut iter = take(v).into_iter();
+                let taken: Vec<JsValue> = v.drain(..).collect();
+                let mut iter = taken.into_iter();
                 while let Some(item) = iter.next() {
                     if item.is_string() == Some(true) {
-                        let mut concat = match added.len() {
+                        let mut concat: Vec<JsValue> = match added.len() {
                             0 => Vec::new(),
                             1 => vec![added.into_iter().next().unwrap()],
                             _ => vec![JsValue::Add(
                                 1 + added.iter().map(|v| v.total_nodes()).sum::<u32>(),
-                                added,
+                                arena.vec_from_iter(added),
                             )],
                         };
                         concat.push(item);
@@ -127,7 +132,7 @@ impl JsValue {
                         }
                         *self = JsValue::Concat(
                             1 + concat.iter().map(|v| v.total_nodes()).sum::<u32>(),
-                            concat,
+                            arena.vec_from_iter(concat),
                         );
                         return;
                     } else {
@@ -137,7 +142,7 @@ impl JsValue {
                 if added.len() == 1 {
                     *self = added.into_iter().next().unwrap();
                 } else {
-                    *v = added;
+                    v.extend(added);
                     self.update_total_nodes();
                 }
             }
@@ -152,10 +157,11 @@ impl JsValue {
                     }
                 }) => {
                     // Taking the old list and constructing a new merged list
-                    for mut v in take(list).into_iter() {
+                    let taken: Vec<JsValue> = list.drain(..).collect();
+                    for mut v in taken {
                         if let JsValue::Logical(_, inner_op, inner_list) = &mut v {
                             if inner_op == op {
-                                list.append(inner_list);
+                                list.extend(inner_list.drain(..));
                             } else {
                                 list.push(v);
                             }
@@ -170,12 +176,12 @@ impl JsValue {
     }
 
     /// Normalizes the current node and all nested nodes.
-    pub fn normalize(&mut self) {
+    pub fn normalize(&mut self, arena: &'a Arena) {
         self.for_each_children_mut(&mut |child| {
-            child.normalize();
+            child.normalize(arena);
             true
         });
-        self.normalize_shallow();
+        self.normalize_shallow(arena);
     }
 }
 
