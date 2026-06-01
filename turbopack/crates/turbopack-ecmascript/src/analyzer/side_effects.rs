@@ -267,6 +267,11 @@ static KNOWN_PURE_REGEXP_PROTOTYPE_METHODS: phf::Set<&'static str> = phf_set! {
     "test", "exec",
 };
 
+/// True if `prop` is the non-computed member property `.<name>`.
+fn prop_is(prop: &MemberProp, name: &str) -> bool {
+    matches!(prop, MemberProp::Ident(i) if i.sym.as_ref() == name)
+}
+
 /// Analyzes a program to determine if it contains side effects at the top level.
 pub fn compute_module_evaluation_side_effects(
     program: &Program,
@@ -355,6 +360,43 @@ impl<'a> SideEffectVisitor<'a> {
             _ => false,
         }
     }
+
+    /// Returns true if `target` writes to the module's own CommonJS exports:
+    /// `exports.x`, `module.exports`, or `module.exports.x`.
+    fn is_cjs_export_target(&self, target: &AssignTarget) -> bool {
+        match target {
+            AssignTarget::Simple(SimpleAssignTarget::Member(member)) => {
+                self.is_cjs_export_member(member)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_cjs_export_member(&self, member: &MemberExpr) -> bool {
+        match unparen(&member.obj) {
+            // `exports.<anything>`, or `module.exports`
+            Expr::Ident(obj) => {
+                self.is_unresolved(obj, "exports")
+                    || (self.is_unresolved(obj, "module") && prop_is(&member.prop, "exports"))
+            }
+            // `module.exports.<anything>`
+            Expr::Member(inner) => self.is_cjs_export_member(inner),
+            _ => false,
+        }
+    }
+
+    /// True if `identifier` is the named, unshadowed module-scope binding.
+    ///
+    /// This prevents code like:
+    ///
+    /// let exports = {};
+    /// exports.foo = 'a';
+    ///
+    /// From being considered a modification of the global `exports` variable.
+    fn is_unresolved(&self, identifier: &Ident, name: &str) -> bool {
+        identifier.ctxt.outer() == self.unresolved_mark && identifier.sym.as_ref() == name
+    }
+
     /// Check if an expression is a known pure built-in function.
     ///
     /// This checks for:
@@ -735,10 +777,18 @@ impl<'a> Visit for SideEffectVisitor<'a> {
                     self.mark_side_effect();
                 }
             }
-            Expr::Assign(_) => {
-                // Assignments have side effects
-                // TODO: allow assignments to module level variables
-                self.mark_side_effect();
+            Expr::Assign(assign) => {
+                // Assigning to the module's own CommonJS exports (`exports.x`,
+                // `module.exports`, `module.exports.x`) is the CJS equivalent of an
+                // ESM `export` declaration.
+                if assign.op == AssignOp::Assign && self.is_cjs_export_target(&assign.left) {
+                    // Still check the assigned value, and the target's computed
+                    // property keys (e.g. `exports[sideEffect()] = …`).
+                    assign.left.visit_with(self);
+                    assign.right.visit_with(self);
+                } else {
+                    self.mark_side_effect();
+                }
             }
             Expr::Update(_) => {
                 // Updates (++, --) have side effects
@@ -2372,8 +2422,41 @@ mod tests {
     mod common_js_modules_tests {
         use super::*;
 
-        side_effects!(test_common_js_exports, "exports.foo = 'a'");
-        side_effects!(test_common_js_exports_module, "module.exports.foo = 'a'");
-        side_effects!(test_common_js_exports_assignment, "module.exports = {}");
+        // Writing the module's own CommonJS exports with a pure value is the CJS
+        // equivalent of an ESM `export` and is not a module-evaluation side effect.
+        no_side_effects!(test_common_js_exports, "exports.foo = 'a'");
+        no_side_effects!(test_common_js_exports_module, "module.exports.foo = 'a'");
+        no_side_effects!(test_common_js_exports_assignment, "module.exports = {}");
+        no_side_effects!(
+            test_common_js_function_exports,
+            "exports.foo = function () { return 1; }; exports.bar = 2;"
+        );
+
+        module_evaluation_is_side_effect_free!(
+            test_common_js_reexport,
+            "module.exports = require('./other');"
+        );
+        module_evaluation_is_side_effect_free!(
+            test_common_js_named_reexports,
+            "exports.a = require('./a'); exports.b = require('./b');"
+        );
+
+        // a side effect in a computed value
+        side_effects!(
+            test_common_js_export_impure_value,
+            "exports.foo = sideEffect();"
+        );
+        // a side effect in a computed export key,
+        side_effects!(
+            test_common_js_export_computed_side_effect,
+            "exports[sideEffect()] = 'a';"
+        );
+        // writing a non-`exports` property of `module`,
+        side_effects!(test_module_non_export_assignment, "module.foo = 'a';");
+        // and a locally-shadowed `exports`.
+        side_effects!(
+            test_shadowed_exports_assignment,
+            "let exports = {}; exports.foo = 'a';"
+        );
     }
 }
