@@ -5,6 +5,7 @@ use swc_core::{
 
 pub(crate) use self::imports::ImportMap;
 
+pub mod arena;
 pub mod builtin;
 pub mod graph;
 pub mod imports;
@@ -14,6 +15,7 @@ pub mod top_level_await;
 pub mod well_known;
 
 mod jsvalue;
+pub use arena::Arena;
 pub use jsvalue::*;
 pub use well_known::{kinds::*, require_context::*};
 
