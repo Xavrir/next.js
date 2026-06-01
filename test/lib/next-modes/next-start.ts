@@ -252,8 +252,18 @@ export class NextStartInstance extends NextInstance {
     options: { env?: Record<string, string>; args?: string[] } = {}
   ) {
     if (this.childProcess) {
+      const { inspect } = require('util') as typeof import('util')
+      const existing = this.childProcess
+      const existingRepr = inspect({
+        pid: existing.pid,
+        spawnfile: existing.spawnfile,
+        spawnopts: existing.spawnargs,
+        exitCode: existing.exitCode,
+        signalCode: existing.signalCode,
+        killed: existing.killed,
+      })
       throw new Error(
-        `can not run export while server is running, use next.stop() first`
+        `can not run export while server is running, use next.stop() first\nexisting process: ${existingRepr}`
       )
     }
 
