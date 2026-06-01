@@ -19,11 +19,10 @@
 //! has side effects. This is safe for tree-shaking purposes as it prevents
 //! incorrectly removing code that might be needed, and can simply be improved over time.
 //!
-//! ## Future Enhancement: Local Variable Mutation Tracking
+//! ## Local Variable Mutation Tracking
 //!
-//! Currently, all assignments, updates, and property mutations are treated as side effects.
-//! However, mutations to locally-scoped variables that never escape the module evaluation scope
-//! could be considered side-effect free. This would handle common patterns like:
+//! Currently, assignments to local unaliased constants and `module.exports` are considered
+//! side-effect free. This handles the common pattern:
 //!
 //! ```javascript
 //! // Currently marked as having side effects, but could be pure:
@@ -33,9 +32,11 @@
 //! export default config;
 //! ```
 //!
-//! A special case to consider would be CJS exports `module.exports ={}` and `export.foo = ` could
-//! be considered non-effecful just like `ESM` exports.  If we do that we should also consider
-//! changing how `require` is handled, currently it is considered to be effectful
+//! All other assignments, updates, and property mutations are currently treated as side effects.
+//! In the future, it would be good to explore non-constant variables. However, this is more
+//! challenging as they can be aliased after being initialised.
+
+use std::collections::HashSet;
 
 use phf::{phf_map, phf_set};
 use swc_core::{
@@ -272,13 +273,64 @@ fn prop_is(prop: &MemberProp, name: &str) -> bool {
     matches!(prop, MemberProp::Ident(i) if i.sym.as_ref() == name)
 }
 
+/// Returns the root identifier of an assignment/update/delete target,
+/// e.g. `a.b.c` -> `a`.
+fn root_identifier(expr: &Expr) -> Option<&Ident> {
+    match unparen(expr) {
+        Expr::Ident(ident) => Some(ident),
+        Expr::Member(member) => root_identifier(&member.obj),
+        _ => None,
+    }
+}
+
+/// Whether this initializer produces a value that isn't aliased from anywhere
+/// else: an object or array literal, which evaluates to a brand-new object that
+/// nothing else holds a reference to.
+fn is_unaliased_variable(init: &Expr) -> bool {
+    matches!(unparen(init), Expr::Object(_) | Expr::Array(_))
+}
+
+/// Returns `const` bindings whose initializer is unaliased;
+/// as determined by is_unaliased_variable().
+///
+/// Mutating these variables are unobservable during module evaluation. A literal
+/// initializer guarantees the object isn't shared with another module or
+/// the global scope. `const c = importedObj; c.x = 1` is unsafe and variables
+/// aliasing other variables would not be returned by this method.
+fn collect_local_constant_ids(program: &Program) -> HashSet<Id> {
+    struct Collector {
+        ids: HashSet<Id>,
+    }
+    impl Visit for Collector {
+        noop_visit_type!();
+        fn visit_var_decl(&mut self, decl: &VarDecl) {
+            if decl.kind == VarDeclKind::Const {
+                for d in &decl.decls {
+                    if let (Pat::Ident(binding), Some(init)) = (&d.name, d.init.as_deref())
+                        && is_unaliased_variable(init)
+                    {
+                        self.ids.insert(binding.id.to_id());
+                    }
+                }
+            }
+            decl.visit_children_with(self);
+        }
+    }
+    let mut collector = Collector {
+        ids: HashSet::new(),
+    };
+    program.visit_with(&mut collector);
+    collector.ids
+}
+
 /// Analyzes a program to determine if it contains side effects at the top level.
 pub fn compute_module_evaluation_side_effects(
     program: &Program,
     comments: &dyn Comments,
     unresolved_mark: Mark,
 ) -> ModuleSideEffects {
-    let mut visitor = SideEffectVisitor::new(comments, unresolved_mark);
+    let local_constant_ids = collect_local_constant_ids(program);
+    let mut visitor = SideEffectVisitor::new(comments, unresolved_mark, local_constant_ids);
     program.visit_with(&mut visitor);
     if visitor.has_side_effects {
         ModuleSideEffects::SideEffectful
@@ -292,16 +344,24 @@ pub fn compute_module_evaluation_side_effects(
 struct SideEffectVisitor<'a> {
     comments: &'a dyn Comments,
     unresolved_mark: Mark,
+    /// local `const` bindings initialized with a fresh object/array literal.
+    /// Assignments to these are not module-evaluation side effects.
+    local_constant_ids: HashSet<Id>,
     has_side_effects: bool,
     will_invoke_fn_exprs: bool,
     has_imports: bool,
 }
 
 impl<'a> SideEffectVisitor<'a> {
-    fn new(comments: &'a dyn Comments, unresolved_mark: Mark) -> Self {
+    fn new(
+        comments: &'a dyn Comments,
+        unresolved_mark: Mark,
+        local_constant_ids: HashSet<Id>,
+    ) -> Self {
         Self {
             comments,
             unresolved_mark,
+            local_constant_ids,
             has_side_effects: false,
             will_invoke_fn_exprs: false,
             has_imports: false,
@@ -361,15 +421,27 @@ impl<'a> SideEffectVisitor<'a> {
         }
     }
 
-    /// Returns true if `target` writes to the module's own CommonJS exports:
-    /// `exports.x`, `module.exports`, or `module.exports.x`.
-    fn is_cjs_export_target(&self, target: &AssignTarget) -> bool {
+    /// Determines whether writing to an assignment target is unobservable during module
+    /// evaluation, so the write itself is not a side effect. Two pure cases:
+    /// - the module's own CommonJS exports (`exports.x`, `module.exports`, `module.exports.x`) —
+    ///   the CJS equivalent of an ESM `export`;
+    /// - a member mutation rooted at a `const` bound to a local object/array.
+    fn assign_target_is_pure(&self, target: &AssignTarget) -> bool {
         match target {
             AssignTarget::Simple(SimpleAssignTarget::Member(member)) => {
-                self.is_cjs_export_member(member)
+                self.member_target_is_pure(member)
             }
             _ => false,
         }
+    }
+
+    /// Assigning to an `a.b.c`-style target is pure if it writes the module's
+    /// own CJS exports, or to a `const` binding holding a local object/array
+    /// literal (that doesn't alias another module's object or a global object).
+    fn member_target_is_pure(&self, member: &MemberExpr) -> bool {
+        self.is_cjs_export_member(member)
+            || matches!(root_identifier(&member.obj), Some(root)
+                if self.local_constant_ids.contains(&root.to_id()))
     }
 
     fn is_cjs_export_member(&self, member: &MemberExpr) -> bool {
@@ -778,12 +850,14 @@ impl<'a> Visit for SideEffectVisitor<'a> {
                 }
             }
             Expr::Assign(assign) => {
-                // Assigning to the module's own CommonJS exports (`exports.x`,
-                // `module.exports`, `module.exports.x`) is the CJS equivalent of an
-                // ESM `export` declaration.
-                if assign.op == AssignOp::Assign && self.is_cjs_export_target(&assign.left) {
+                // Writing the module's own CommonJS exports (`exports.x`,
+                // `module.exports`), or a member of a `const` bound to a fresh
+                // object/array (e.g. `const o = {}; o.a = 1`), is not an
+                // observable module-evaluation side effect, as long as the
+                // assigned value (and any computed key) is pure.
+                if assign.op == AssignOp::Assign && self.assign_target_is_pure(&assign.left) {
                     // Still check the assigned value, and the target's computed
-                    // property keys (e.g. `exports[sideEffect()] = …`).
+                    // property keys (e.g. `o[sideEffect()] = …`).
                     assign.left.visit_with(self);
                     assign.right.visit_with(self);
                 } else {
@@ -2453,10 +2527,57 @@ mod tests {
         );
         // writing a non-`exports` property of `module`,
         side_effects!(test_module_non_export_assignment, "module.foo = 'a';");
-        // and a locally-shadowed `exports`.
+    }
+
+    mod local_variable_mutation_tests {
+        use super::*;
+
+        // The motivating case: building up a `const` object/array bound to a
+        // fresh literal before exporting it. The mutations are unobservable
+        // during evaluation.
+        no_side_effects!(
+            test_const_object_build,
+            "const config = {}; config['a'] = 'a'; config['b'] = 'b'; export default config;"
+        );
+        no_side_effects!(test_const_member_assignment, "const o = {}; o.a = 1;");
+        no_side_effects!(test_const_array_index, "const a = []; a[0] = 1;");
+        no_side_effects!(test_const_nested_member, "const o = { a: {} }; o.a.b = 1;");
+
+        // Boundaries that must remain side-effectful:
+        // a `const` aliasing an imported object (the mutation hits the import),
         side_effects!(
-            test_shadowed_exports_assignment,
-            "let exports = {}; exports.foo = 'a';"
+            test_aliased_import_mutation,
+            "import config from './config'; const c = config; c.enabled = true;"
+        );
+        // a `const` aliasing the global object,
+        side_effects!(
+            test_aliased_global_mutation,
+            "const g = globalThis; g.shared = 1;"
+        );
+        // mutating an imported binding directly,
+        side_effects!(
+            test_imported_binding_mutation,
+            "import obj from 'x'; obj.foo = 1;"
+        );
+        // a non-fresh `const` initializer (may be a shared reference),
+        side_effects!(
+            test_non_local_constant_init,
+            "const o = makeObj(); o.a = 1;"
+        );
+        // a `let` binding (could be reassigned to an alias; handled later),
+        side_effects!(test_let_object_mutation, "let o = {}; o.a = 1;");
+        // assigning a global or an undeclared variable,
+        side_effects!(test_global_assignment, "globalThis.shared = 1;");
+        side_effects!(test_undeclared_assignment, "leaked = 1;");
+        // an impure assigned value,
+        side_effects!(
+            test_local_constant_impure_value,
+            "const o = {}; o.a = sideEffect();"
+        );
+        // and a side effect in a computed key.
+        side_effects!(
+            test_local_constant_computed_key_side_effect,
+            "const o = {}; o[sideEffect()] = 1;"
         );
     }
 }
